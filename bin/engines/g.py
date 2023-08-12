@@ -1,12 +1,38 @@
 import requests, re, json, time
 from logging import Logger
 from bs4 import BeautifulSoup
-from aqt import QWebEngineView, QUrl, mw, QWebEnginePage, QThread, QObject, QWebChannel, pyqtSlot
-from typing import Callable
 from ..engine import *
 
-_URL = 'https://www.google.com/search?source=lnms&tbm=isch&'
-result: str
+def url(query: str):
+    return (
+        'https://www.google.com/search?safe=off&site=&tbm=isch&source=hp&gs_l=img'
+        '&q=' + query +'&oq=' + query
+    )
+
+def parseurl(url: str):
+    regex = re.compile( # https://stackoverflow.com/a/67099046
+        r"(\w+://)?"                                        # protocol
+        r"((?:[\w\-]+\.)*)"                                 # host/subdomain
+        r"([\w\-]+)"                                        # domain
+        r"(?:\.([\w\-]+))"                                  # top-level domain
+        r"(/(?:[\w\-.,~!$&'()*+;=:@/]|%[0-9a-fA-F]{2})*)?"  # path
+        r"(\?[^:/?#[\]@]+)*"                                # params
+        r"(#.*)?"                                           # anchor
+    )
+    if res := regex.match(url):
+        return {
+            'protocol': res.group(1) or '',
+            'host-subdomain': res.group(2)[:-1] if res.group(2) else '',
+            'domain': res.group(3),
+            'tld': res.group(4),
+            'path': res.group(5)[1:] if res.group(5) else '',
+            'params': res.group(6)[1:] if res.group(6) else '',
+            'anchor': res.group(7)[1:] if res.group(7) else ''
+        }
+    return None
+
+def decode_json(string: str):
+    return json.loads(f'{{"1": "{string}"}}')['1']
 
 class Google(Engine):
     """Google search engine (BeautifulSoup) implementation"""
@@ -28,7 +54,7 @@ class Google(Engine):
 <li>cats -dogs => Fewer dogs in results</li>
 <li>cats +dogs => More dogs in results</li>
 <li>site:commons.wikimedia.org => Only results from commons.wikimedia.org</li>
-<li>intitle:anki => Only results with page title including "anki"</li>
+<li>intitle:anki => Only results with webview.page() title including "anki"</li>
 <li>maxn:10 => Only first 10 results (default all)</li></ul>"""
 
     def search(self, query: str):
@@ -41,52 +67,48 @@ class Google(Engine):
             else:
                 query = m.group(1).strip() if m.group(1) else m.group(3).strip()
 
-        def onload(*_):
-            nonlocal loaded
-            loaded = True
-        
-        def onscript(res):
-            nonlocal result
-            result = res or ""
+        html = requests.get(
+            url = "https://www.google.com/search",
+            params = {
+                "q": "a. vertebralis",          # search query
+                "tbm": "isch",                  # image results
+                "hl": "en",                     # language of the search
+                "gl": "us",                     # country where search comes from
+                "ijn": "0"                      # page number
+            },
+            headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.5060.114 Safari/537.36"
+            },
+            cookies = {
+                'CONSENT' : 'YES+'              # Google consent
+            },
+            timeout = 30
+        )
+        soup = BeautifulSoup(html.text, "html.parser")
+        result = []
 
-        # Setup browser
-        print("Setup browser")
-        page = QWebEnginePage()
-        channel = QWebChannel(page)
-        py = Bridge(page)
-        channel.registerObject("py", py)
-        page.setWebChannel(channel)
+        # look in script tags with AF_initDataCallback calls which contain the data
+        for script in re.findall(
+                r"AF_initDataCallback\(([^<]+)\);",
+                str(soup.select("script"))
+            ):
+            for (url, height_title, width) in re.findall(
+                r'"(https?://[^"]+)"\s*,\s*(\d+|"[^"]+")\s*,\s*(\d+|null)',
+                script
+            ):
+                url = decode_json(url)
+                purl = parseurl(url)
+                if not purl or (purl['domain'] == 'gstatic' and purl['tld'] == 'com'):
+                    continue
+                try:
+                    h = int(height_title)
+                    w = int(width)
+                    result.append(Match(url=url, height=h, width=w))
+                except:
+                    if result:
+                        result[-1].title = decode_json(height_title[1:-1])
+                        if len(result) == maxn:
+                            break
 
-        # Load google search
-        print("Load search")
-        loaded = False
-        connection = page.loadFinished.connect(onload)
-        page.load(QUrl(f'{_URL}q={query}'))
-        while not loaded:
-            mw.app.processEvents()
-        
-        # Script page to get result
-        print("Script")
-        result = None
-        page.runJavaScript(f'''(async function () {{
-            await new Promise(r => setTimeout(r, 2000));
-            itms = [];
-            document.querySelectorAll('h3').forEach((el) => {{itms.push(el.innerText)}})
-            return JSON.stringify(itms);
-        }})();''',
-        onscript)
-        while result is None:
-            mw.app.processEvents()
-        
-        # Parse results
-        print(f"Parse results: {result}")
-        result = json.loads(result)
-        print(f"Parsed results: {result}")
+        print('returning:\n  ' + "\n  ".join([r.url for r in result]))
         return result
-
-class Bridge(QObject):
-    """Class to handle js bridge"""
-    @pyqtSlot(str, result=str)
-    def cmd(self, cmd):
-        print(f'cmd: {cmd}')
-        pass
